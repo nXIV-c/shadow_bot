@@ -19,5 +19,5 @@ An asynchronous Python Telegram bot for tracking real-time cryptocurrency rates,
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/your_username/shadow_bot.git](https://github.com/your_username/shadow_bot.git)
+   git clone https://github.com/nXIV-c/shadow_bot.git
    cd shadow_bot
