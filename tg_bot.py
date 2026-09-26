@@ -1,7 +1,8 @@
 import os
 import time
 import telebot
-from telebot import apihelper
+from telebot import apihelper, BaseMiddleware
+from telebot.handler_backends import CancelUpdate
 from dotenv import load_dotenv
 
 # Import custom modules
@@ -15,63 +16,81 @@ load_dotenv()
 apihelper.API_URL = "https://royal-math-a6b6.n-xiv98.workers.dev/bot{0}/{1}"
 
 TOKEN = os.getenv("BOT_TOKEN")
-bot = telebot.TeleBot(TOKEN)
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(user_id.strip()) for user_id in admin_ids_str.split(",") if user_id.strip()]
+bot = telebot.TeleBot(TOKEN, use_class_middlewares=True)
 
 init_db()
 
-# --- STREET RULES & SECURITY (STRIKE SYSTEM) ---
-USER_LAST_MSG_TIME = {}
-USER_STRIKES = {}
-BLACKLIST = set()
+# --- MIDDLEWARE: ANTI-SPAM & STRIKES ---
+class AntispamMiddleware(BaseMiddleware):
+    def __init__(self, bot_instance):
+        super().__init__()
+        self.bot = bot_instance
+        self.update_types = ['message']
+        self.user_state = {}
 
-SPAM_THRESHOLD = 3.0  # seconds between requests to trigger a strike
-MAX_STRIKES = 3
+        self.message_cooldown = 3.0       # Seconds between requests
+        self.strike_reset_time = 300      # Strikes expire after 5 minutes
+        self.max_strikes = 3
 
-def check_security(user_id):
-    """Returns 'BANNED', 'WARNING', or 'CLEAR'."""
-    if user_id in BLACKLIST:
-        return "BANNED"
-        
-    current_time = time.time()
-    last_time = USER_LAST_MSG_TIME.get(user_id, 0)
-    
-    if current_time - last_time < SPAM_THRESHOLD:
-        strikes = USER_STRIKES.get(user_id, 0) + 1
-        USER_STRIKES[user_id] = strikes
-        USER_LAST_MSG_TIME[user_id] = current_time
-        
-        if strikes >= MAX_STRIKES:
-            BLACKLIST.add(user_id)
-            return "BANNED"
-        return "WARNING"
-        
-    USER_LAST_MSG_TIME[user_id] = current_time
-    return "CLEAR"
+    def pre_process(self, message, data):
+        user_id = message.from_user.id
+        current_time = time.time()
 
-def handle_violation(message, status):
-    """Handles responses for rule breakers."""
-    if status == "BANNED":
-        bot.reply_to(message, "💀 **BLACKLISTED.**\n\nYou made too much noise. You're cut off from the syndicate.", parse_mode="Markdown")
-    elif status == "WARNING":
-        strikes = USER_STRIKES.get(message.from_user.id, 1)
-        bot.reply_to(message, f"⚠️ **Watch your step.** You're moving too fast. Slow down.\n_Strike {strikes}/{MAX_STRIKES}_", parse_mode="Markdown")
+        user = self.user_state.setdefault(user_id, {
+            'last_msg_time': 0,
+            'last_strike_time': 0,
+            'strikes': 0,
+            'banned': False
+        })
+
+        if user['banned']:
+            return CancelUpdate()
+
+        # Amnesty: reset strikes after a long period of good behavior
+        if user['strikes'] > 0 and (current_time - user['last_strike_time'] > self.strike_reset_time):
+            user['strikes'] = 0
+
+        # Flood detection
+        if current_time - user['last_msg_time'] < self.message_cooldown:
+            user['strikes'] += 1
+            user['last_strike_time'] = current_time
+            user['last_msg_time'] = current_time
+
+            if user['strikes'] >= self.max_strikes:
+                user['banned'] = True
+                self.bot.send_message(
+                    user_id,
+                    "💀 **BLACKLISTED.**\n\nYou made too much noise. You're cut off from the syndicate.",
+                    parse_mode="Markdown"
+                )
+            else:
+                self.bot.send_message(
+                    user_id,
+                    f"⚠️ **Watch your step.** You're moving too fast. Slow down.\n_Strike {user['strikes']}/{self.max_strikes}_", 
+                    parse_mode="Markdown"
+                )
+
+            return CancelUpdate()
+
+        user['last_msg_time'] = current_time
+
+    def post_process(self, message, data, exception):
+        pass
+
+bot.setup_middleware(AntispamMiddleware(bot))
 
 # --- SUPPORTED ASSETS ---
 SUPPORTED_COINS = ["BTC", "ETH", "SOL", "BNB", "TON", "XRP", "DOGE"]
 
 # --- COMMAND HANDLERS ---
-
 @bot.message_handler(commands=['start', 'help'])
 def handle_start(message):
     user_id = message.from_user.id
-    status = check_security(user_id)
-    if status != "CLEAR":
-        handle_violation(message, status)
-        return
-
     username = message.from_user.username or "Unknown"
     add_user(user_id, username)
-    
+
     welcome_msg = (
         "🏴 **SYNDICATE NETWORK ACCESSED**\n\n"
         "No names. No faces. We just track the money.\n"
@@ -87,41 +106,27 @@ def handle_start(message):
 
 @bot.message_handler(commands=['news', 'intel'])
 def handle_news(message):
-    user_id = message.from_user.id
-    status = check_security(user_id)
-    if status != "CLEAR":
-        handle_violation(message, status)
-        return
-        
     bot.send_chat_action(message.chat.id, "typing")
-    
     headlines = scrape_crypto_news()
-    
+
     if not headlines:
         bot.reply_to(message, "Dead end. The informants are quiet right now.")
         return
-        
+
     response = "👁️ WORD ON THE STREET:\n\n"
     for idx, title in enumerate(headlines, 1):
         response += f"{idx}. {title}\n\n"
-        
-    # No Markdown mode here to prevent Telegram parsing exceptions on special chars in news titles
+
     bot.reply_to(message, response)
 
-@bot.message_handler(commands=['history', 'stats'])
+@bot.message_handler(commands=['history', 'stats', 'ledger'])
 def handle_stats(message):
-    user_id = message.from_user.id
-    status = check_security(user_id)
-    if status != "CLEAR":
-        handle_violation(message, status)
-        return
-        
     records = get_last_prices(limit=5)
-    
+
     if not records:
         bot.reply_to(message, "No records. The ledger is clean.", parse_mode="Markdown")
         return
-        
+
     response = "📓 **THE LEDGER (RECENT DROPS):**\n\n"
     for row in records:
         coin = str(row[1])
@@ -130,44 +135,48 @@ def handle_stats(message):
             price_str = f"${price:,.2f}"
         except (ValueError, TypeError):
             price_str = f"${row[2]}"
-            
+
         timestamp = str(row[-1])
         response += f"• **{coin}** | `{price_str}` | `{timestamp}`\n"
-        
+
     bot.reply_to(message, response, parse_mode="Markdown")
 
 @bot.message_handler(commands=['shadow'])
 def handle_shadow(message):
-    user_id = message.from_user.id
-    status = check_security(user_id)
-    if status != "CLEAR":
-        handle_violation(message, status)
-        return
-        
     bot.reply_to(
-        message, 
+        message,
         "You're digging too deep. Fall back before you get buried.",
         parse_mode="Markdown"
     )
 
-# --- TEXT MESSAGES HANDLER ---
+@bot.message_handler(commands=['unban'])
+def admin_unban(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        target_id = int(message.text.split()[1])
+
+        for middleware in bot.middlewares:
+            if isinstance(middleware, AntispamMiddleware):
+                if target_id in middleware.user_state:
+                    middleware.user_state[target_id]['strikes'] = 0
+                    middleware.user_state[target_id]['banned'] = False
+                    bot.reply_to(message, f"✅ Access restored for `{target_id}`.", parse_mode="Markdown")
+                else:
+                    bot.reply_to(message, f"Target `{target_id}` not found in current memory cycle.", parse_mode="Markdown")
+                return
+    except (IndexError, ValueError):
+        bot.reply_to(message, "Syntax: `/unban `", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
-    user_id = message.from_user.id
-    status = check_security(user_id)
-    if status != "CLEAR":
-        handle_violation(message, status)
-        return
-        
-    # Edge case protection: ensure message contains actual text (not sticker/photo)
     if not message.text:
         bot.reply_to(message, "Watch your mouth. Only plaintext signals accepted.")
         return
 
     text = message.text.strip().upper()
-    
-    # Catch plain text keywords without slashes
+
     if text in ["NEWS", "INTEL"]:
         handle_news(message)
         return
@@ -177,14 +186,12 @@ def handle_text(message):
     elif text == "SHADOW":
         handle_shadow(message)
         return
-        
+
     if text in SUPPORTED_COINS:
         bot.send_chat_action(message.chat.id, "typing")
-        
         status_msg = bot.reply_to(message, f"Checking the stash for {text}...", parse_mode="Markdown")
-        
         price = fetch_binance_api(text)
-        
+
         if price:
             try:
                 formatted_price = f"${float(price):,.2f} USDT"
@@ -201,20 +208,19 @@ def handle_text(message):
             bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg.message_id, text=f"Connection severed. Couldn't pull numbers for `{text}`.", parse_mode="Markdown")
     else:
         bot.reply_to(
-            message, 
+            message,
             "Watch your mouth. Invalid drop.\n"
             f"Stick to the authorized assets: `{', '.join(SUPPORTED_COINS)}`",
             parse_mode="Markdown"
         )
 
 # --- ENGINE IGNITION ---
-
 if __name__ == "__main__":
     print("=== SYNDICATE BOT RUNNING ===")
     print("[*] Strict security enforced.")
     print("[*] Awaiting signals...")
-    
+
     try:
-        bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=True)
     except Exception as e:
         print(f"\n[!] SYSTEM FAILURE: {e}")
