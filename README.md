@@ -12,7 +12,7 @@ A small Telegram bot with a "syndicate" personality. Send it a ticker and it rep
 
 ## Tech stack
 
-| | |
+| Area | Technology |
 |---|---|
 | Language | Python 3.10+ |
 | Telegram | `pyTelegramBotAPI` (synchronous, handles messages in threads) |
