@@ -2,6 +2,21 @@ import requests
 from bs4 import BeautifulSoup
 from database import save_price
 
+NEWS_FEED_URL = "https://cointelegraph.com/rss"
+NEWS_LIMIT = 5
+# Kept from the first version: some news sites refuse unknown clients. If the feed
+# still works with an honest name (e.g. "shadow-bot/1.1"), prefer that.
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/115.0.0.0 Safari/537.36"
+)
+_IGNORE_KEYWORDS = (
+    "here's what happened in crypto today",
+    "subscribe to",
+    "weekly digest",
+)
+
 
 def fetch_binance_api(coin_symbol):
     """Fetch real-time price from Binance API."""
@@ -19,49 +34,37 @@ def fetch_binance_api(coin_symbol):
             return price
     except Exception as e:
         print(f"[!] API Error: {e}")
-        return None
+    return None
+
+
+def parse_headlines(feed_xml, limit=NEWS_LIMIT):
+    """Return up to ``limit`` clean, unique headlines from an RSS document."""
+    soup = BeautifulSoup(feed_xml, "xml")
+    headlines = []
+
+    for item in soup.find_all("item"):
+        title = item.find("title")
+        if title:
+            clean_title = title.text.strip()
+            # News sites write "Here\u2019s" with a curly apostrophe; compare with a straight one.
+            plain_title = clean_title.lower().replace("\u2019", "'")
+            is_trash = any(kw in plain_title for kw in _IGNORE_KEYWORDS)
+
+            if clean_title and not is_trash and clean_title not in headlines:
+                headlines.append(clean_title)
+
+        if len(headlines) == limit:
+            break
+
+    return headlines
 
 
 def scrape_crypto_news():
-    """Scrape top crypto news using RSS feed (reliable & fast)."""
-    url = "https://cointelegraph.com/rss"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/115.0.0.0 Safari/537.36"
-        )
-    }
-
-    ignore_keywords = [
-        "here's what happened in crypto today",
-        "subscribe to",
-        "weekly digest",
-    ]
-
+    """Fetch top crypto news from the public RSS feed (reliable and fast)."""
     try:
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(NEWS_FEED_URL, headers={"User-Agent": _USER_AGENT}, timeout=5)
         response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, "xml")
-        headlines = []
-
-        for item in soup.find_all("item"):
-            title = item.find("title")
-            if title:
-                clean_title = title.text.strip()
-                is_trash = any(
-                    kw in clean_title.lower() for kw in ignore_keywords
-                )
-
-                if not is_trash and clean_title not in headlines:
-                    headlines.append(clean_title)
-
-            if len(headlines) == 5:
-                break
-
-        return headlines
-
+        return parse_headlines(response.text)
     except Exception as e:
         print(f"[!] Scraping Error: {e}")
         return []

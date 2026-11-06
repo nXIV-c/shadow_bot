@@ -1,88 +1,72 @@
-import os
-import time
 import telebot
 from telebot import apihelper, BaseMiddleware
 from telebot.handler_backends import CancelUpdate
-from dotenv import load_dotenv
 
 # Import custom modules
+from antispam import AntiSpam, BAN, IGNORE, WARN
+from config import load_settings
 from database import init_db, add_user, get_last_prices
+from formatting import format_ledger, format_price
 from parser import fetch_binance_api, scrape_crypto_news
 
 # --- SYSTEM INITIALIZATION ---
-load_dotenv()
+try:
+    settings = load_settings()
+except RuntimeError as exc:
+    raise SystemExit(f"Configuration error: {exc}") from exc
 
-# Custom Worker reverse proxy for Telegram API bypass
-apihelper.API_URL = "https://royal-math-a6b6.n-xiv98.workers.dev/bot{0}/{1}"
+# Optional reverse proxy for the Telegram API (for example a Cloudflare Worker).
+if settings.telegram_api_url:
+    apihelper.API_URL = settings.telegram_api_url
 
-TOKEN = os.getenv("BOT_TOKEN")
-admin_ids_str = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(user_id.strip()) for user_id in admin_ids_str.split(",") if user_id.strip()]
-bot = telebot.TeleBot(TOKEN, use_class_middlewares=True)
+ADMIN_IDS = settings.admin_ids
+bot = telebot.TeleBot(settings.bot_token, use_class_middlewares=True)
 
 init_db()
 
+
 # --- MIDDLEWARE: ANTI-SPAM & STRIKES ---
 class AntispamMiddleware(BaseMiddleware):
-    def __init__(self, bot_instance):
+    """Connects the AntiSpam rules to Telegram: drops flooding messages and warns the user."""
+
+    def __init__(self, bot_instance, antispam=None):
         super().__init__()
         self.bot = bot_instance
         self.update_types = ['message']
-        self.user_state = {}
-
-        self.message_cooldown = 3.0       # Seconds between requests
-        self.strike_reset_time = 300      # Strikes expire after 5 minutes
-        self.max_strikes = 3
+        self.antispam = antispam or AntiSpam()
 
     def pre_process(self, message, data):
-        user_id = message.from_user.id
-        current_time = time.time()
+        verdict = self.antispam.check(message.from_user.id)
 
-        user = self.user_state.setdefault(user_id, {
-            'last_msg_time': 0,
-            'last_strike_time': 0,
-            'strikes': 0,
-            'banned': False
-        })
-
-        if user['banned']:
+        if verdict.action == IGNORE:
             return CancelUpdate()
 
-        # Amnesty: reset strikes after a long period of good behavior
-        if user['strikes'] > 0 and (current_time - user['last_strike_time'] > self.strike_reset_time):
-            user['strikes'] = 0
-
-        # Flood detection
-        if current_time - user['last_msg_time'] < self.message_cooldown:
-            user['strikes'] += 1
-            user['last_strike_time'] = current_time
-            user['last_msg_time'] = current_time
-
-            if user['strikes'] >= self.max_strikes:
-                user['banned'] = True
-                self.bot.send_message(
-                    user_id,
-                    "💀 **BLACKLISTED.**\n\nYou made too much noise. You're cut off from the syndicate.",
-                    parse_mode="Markdown"
-                )
-            else:
-                self.bot.send_message(
-                    user_id,
-                    f"⚠️ **Watch your step.** You're moving too fast. Slow down.\n_Strike {user['strikes']}/{self.max_strikes}_", 
-                    parse_mode="Markdown"
-                )
-
+        if verdict.action == BAN:
+            self.bot.send_message(
+                message.from_user.id,
+                "💀 **BLACKLISTED.**\n\nYou made too much noise. You're cut off from the syndicate.",
+                parse_mode="Markdown"
+            )
             return CancelUpdate()
 
-        user['last_msg_time'] = current_time
+        if verdict.action == WARN:
+            self.bot.send_message(
+                message.from_user.id,
+                f"⚠️ **Watch your step.** You're moving too fast. Slow down.\n_Strike {verdict.strikes}/{self.antispam.max_strikes}_",
+                parse_mode="Markdown"
+            )
+            return CancelUpdate()
 
     def post_process(self, message, data, exception):
         pass
 
-bot.setup_middleware(AntispamMiddleware(bot))
+
+antispam_middleware = AntispamMiddleware(bot)
+bot.setup_middleware(antispam_middleware)
 
 # --- SUPPORTED ASSETS ---
 SUPPORTED_COINS = ["BTC", "ETH", "SOL", "BNB", "TON", "XRP", "DOGE"]
+
 
 # --- COMMAND HANDLERS ---
 @bot.message_handler(commands=['start', 'help'])
@@ -104,6 +88,7 @@ def handle_start(message):
     )
     bot.reply_to(message, welcome_msg, parse_mode="Markdown")
 
+
 @bot.message_handler(commands=['news', 'intel'])
 def handle_news(message):
     bot.send_chat_action(message.chat.id, "typing")
@@ -119,6 +104,7 @@ def handle_news(message):
 
     bot.reply_to(message, response)
 
+
 @bot.message_handler(commands=['history', 'stats', 'ledger'])
 def handle_stats(message):
     records = get_last_prices(limit=5)
@@ -127,19 +113,8 @@ def handle_stats(message):
         bot.reply_to(message, "No records. The ledger is clean.", parse_mode="Markdown")
         return
 
-    response = "📓 **THE LEDGER (RECENT DROPS):**\n\n"
-    for row in records:
-        coin = str(row[1])
-        try:
-            price = float(row[2])
-            price_str = f"${price:,.2f}"
-        except (ValueError, TypeError):
-            price_str = f"${row[2]}"
+    bot.reply_to(message, format_ledger(records), parse_mode="Markdown")
 
-        timestamp = str(row[-1])
-        response += f"• **{coin}** | `{price_str}` | `{timestamp}`\n"
-
-    bot.reply_to(message, response, parse_mode="Markdown")
 
 @bot.message_handler(commands=['shadow'])
 def handle_shadow(message):
@@ -149,6 +124,7 @@ def handle_shadow(message):
         parse_mode="Markdown"
     )
 
+
 @bot.message_handler(commands=['unban'])
 def admin_unban(message):
     if message.from_user.id not in ADMIN_IDS:
@@ -156,18 +132,15 @@ def admin_unban(message):
 
     try:
         target_id = int(message.text.split()[1])
-
-        for middleware in bot.middlewares:
-            if isinstance(middleware, AntispamMiddleware):
-                if target_id in middleware.user_state:
-                    middleware.user_state[target_id]['strikes'] = 0
-                    middleware.user_state[target_id]['banned'] = False
-                    bot.reply_to(message, f"✅ Access restored for `{target_id}`.", parse_mode="Markdown")
-                else:
-                    bot.reply_to(message, f"Target `{target_id}` not found in current memory cycle.", parse_mode="Markdown")
-                return
     except (IndexError, ValueError):
-        bot.reply_to(message, "Syntax: `/unban `", parse_mode="Markdown")
+        bot.reply_to(message, "Syntax: `/unban 123456789`", parse_mode="Markdown")
+        return
+
+    if antispam_middleware.antispam.unban(target_id):
+        bot.reply_to(message, f"✅ Access restored for `{target_id}`.", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, f"Target `{target_id}` not found in current memory cycle.", parse_mode="Markdown")
+
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
@@ -193,10 +166,7 @@ def handle_text(message):
         price = fetch_binance_api(text)
 
         if price:
-            try:
-                formatted_price = f"${float(price):,.2f} USDT"
-            except (ValueError, TypeError):
-                formatted_price = f"${price} USDT"
+            formatted_price = f"{format_price(price)} USDT"
 
             final_msg = (
                 f"💰 **{text} SECURED**\n\n"
@@ -213,6 +183,7 @@ def handle_text(message):
             f"Stick to the authorized assets: `{', '.join(SUPPORTED_COINS)}`",
             parse_mode="Markdown"
         )
+
 
 # --- ENGINE IGNITION ---
 if __name__ == "__main__":
