@@ -2,6 +2,18 @@
 
 A small Telegram bot with a "syndicate" personality. Send it a ticker and it replies with the live price from Binance; ask for `/news` and it returns the latest crypto headlines from a public RSS feed. It has built-in flood protection and runs as a background service on a Linux server.
 
+## Screenshots
+
+<p>
+  <img src="docs/help.jpeg" alt="/help: the bot's welcome message" width="270">
+  <img src="docs/price.jpeg" alt="Price lookup: BTC" width="270">
+  <img src="docs/news.jpeg" alt="Latest crypto headlines" width="270">
+</p>
+<p>
+  <img src="docs/history.jpeg" alt="History of recent lookups" width="270">
+  <img src="docs/spam.jpeg" alt="Input validation and an anti-spam strike" width="270">
+</p>
+
 ## Features
 
 - **Live prices** for BTC, ETH, SOL, BNB, TON, XRP and DOGE (Binance public API, no API key needed).
